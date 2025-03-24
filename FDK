@@ -1,0 +1,196 @@
+import numpy
+import tomosipo as sipo
+import matplotlib.pyplot as plt
+import astra
+import time
+import torch
+import multiprocessing as mp
+from multiprocessing.pool import ThreadPool
+from scipy.interpolate import RectBivariateSpline as RBS
+from scipy.interpolate import RegularGridInterpolator as RGI
+from skimage.registration import phase_cross_correlation as pcc
+
+# read data
+# functions
+def read_xteck(file):
+    file = open(file)
+    info = file.readlines()   
+    for line in info:
+        if line.strip().startswith("VoxelSizeX"):
+            voxel = float(line.strip().split('=')[1])
+        if line.strip().startswith("SrcToObject"):
+            sod = float(line.strip().split('=')[1])
+        if line.strip().startswith("SrcToDetector"):
+            sdd = float(line.strip().split('=')[1])
+        if line.strip().startswith("DetectorPixelsX"):
+            cols = int(line.strip().split('=')[1])
+        if line.strip().startswith("DetectorPixelsY"):
+            rows = int(line.strip().split('=')[1])
+        if line.strip().startswith("DetectorPixelSizeX"):
+            pixel = float(line.strip().split('=')[1])
+        if line.strip().startswith("Projections"):
+            angles = int(line.strip().split('=')[1])
+        if line.strip().startswith("AngularStep"):
+            rot_step = float(line.strip().split('=')[1])          
+    return voxel, sod, sdd, rows, cols, pixel, angles, rot_step
+
+def read_log_nikon(path, prefix, white, angles, pixels = 2000): # angles=num_of_projections
+    print('reading')
+    det_offset = int(63 * 2) # in bytes
+    det_len = int(pixels * pixels)
+    g = numpy.zeros((pixels, angles, pixels), dtype = 'float32')
+    def read_proj(pr):
+        g[:,pr,:] = numpy.fromfile(path + prefix + str(pr+1).zfill(4) + '.tif', dtype='uint16', offset=det_offset, count=det_len).reshape(pixels, pixels)
+        g[:,pr,:] = -numpy.log(numpy.maximum(0.001, g[:,pr,:] / white ))
+    pool = ThreadPool(mp.cpu_count() - 10)
+    pool.map(read_proj, numpy.arange(angles))
+    pool.close()
+    return g
+
+# Geometry, fp, bp in tomosipo
+def vectors_astra(pixel, voxel, sod, sdd, rot_step, angles, det_x, det_y, eta):
+    # eta theta phi in degrees  
+    pixel /= voxel 
+    angles_seq = (numpy.arange(angles) * rot_step + 0.) #* numpy.pi / 180 #CTPROinitialAngle
+    angles_seq *= numpy.pi / 180  
+    sod /= voxel
+    sdd /= voxel
+    odd = sdd - sod  
+    mgn_i = sod / sdd  
+    det_x /= voxel
+    det_y /= voxel 
+    eta *= numpy.pi / 180
+    theta = 0; phi = 0    # 
+    theta *= numpy.pi / 180 
+    phi *= numpy.pi / 180
+    sangles = numpy.sin(angles_seq)
+    cangles = numpy.cos(angles_seq)
+    # rotation matrices    
+    def ss(a):
+        return numpy.sin(a)
+    def cc(a):
+        return numpy.cos(a)
+    def rot_eta(a):
+        return numpy.array([[1,0,0],[0,cc(a),-ss(a)],[0,ss(a),cc(a)]])
+    def rot_theta(a):
+        return numpy.array([[cc(a),0,-ss(a)],[0,1,0],[ss(a),0,cc(a)]])
+    def rot_phi(a):
+        return numpy.array([[cc(a),-ss(a),0],[ss(a),cc(a),0],[0,0,1]])
+    u_shift = sangles * det_x
+    v_shift = cangles * det_x
+    rot_det = rot_theta(theta) @ rot_phi(phi) @ rot_eta(eta)
+    det_u = rot_det @ numpy.array([0, pixel, 0])
+    det_v = rot_det @ numpy.array([0, 0, pixel]) 
+    vectors = numpy.zeros((angles, 12))
+    # (source, detector center, det01, det10)    
+    vectors[:,0] = cangles * sod     
+    vectors[:,1] = -sangles * sod     
+    vectors[:,2] = 0
+    vectors[:,3] = -cangles * odd + u_shift    
+    vectors[:,4] = sangles * odd + v_shift
+    vectors[:,5] = det_y
+    vectors[:,6] = cangles * det_u[0] + sangles * det_u[1]
+    vectors[:,7] = -sangles * det_u[0] + cangles * det_u[1]
+    vectors[:,8] = det_u[2]
+    vectors[:,9] = cangles * det_v[0] + sangles * det_v[1]
+    vectors[:,10] = -sangles * det_v[0] + cangles * det_v[1]
+    vectors[:,11] = det_v[2]
+    return vectors
+
+def operators3Dsipo(pixels, FOV, slices, slices_data, vectors, magn):
+    vol_geom = sipo.volume_vec(shape = (FOV, FOV, slices), pos = (0/pixels,0/pixels,0/pixels), \
+                               w=(1/pixels, 0, 0), v=(0, 1/pixels, 0), u=(0, 0, 1/pixels)) 
+    cone_geom = sipo.cone_vec(shape = (slices_data, pixels), src_pos= vectors[:,0:3]/pixels, \
+                              det_pos=(vectors[:,3:6])/pixels, det_v = vectors[:,9:12]/pixels, det_u = vectors[:,6:9]/pixels)    
+    G = sipo.operator(vol_geom, cone_geom)
+    fp = lambda X: G(X) 
+    bp = lambda Y: G.T(Y)
+    return fp, bp
+
+# shift
+def shift_x_2d(g, sod, sdd, pixel, rot_step):
+    # x shift of the center of rotation in mm
+    # based on fanbeam symmetry relantionship
+    # g can be fan or conebeam
+    if len(g.shape) == 3:
+        g = g[g.shape[0]//2 - 1]*0 + g[g.shape[0]//2]
+    angles, columns = g.shape   
+    magn_i = sod / sdd
+    s_M = (columns * pixel * magn_i - 1) * 0.5
+    beta = numpy.arange(angles) * rot_step * numpy.pi / 180
+    s = numpy.linspace(-s_M, s_M, columns)# - shift_0 * magn_i
+    interpolator = RBS(beta, s, g, kx = 1, ky = 1)  
+    upsampling = 1 / 0.01  # for image registration, 1 / pixels
+    twopi = 2 * numpy.pi
+    f2 = numpy.zeros((angles, columns))
+    sh_0 = 2*numpy.arctan2(s, sod) + numpy.pi       
+    for bb in numpy.arange(angles):
+        beta_s = sh_0 + beta[bb]
+        mask = beta_s > twopi
+        beta_s[mask] -= twopi
+        f2[bb,:] = interpolator(beta_s, -s , grid = False)
+    #plt.figure(1); plt.imshow(g)
+    #plt.figure(2); plt.imshow(f2); plt.show(); exit()
+    #plt.figure(12); plt.plot(g[0]); plt.plot(f2[0])
+    shifts = pcc(g, f2, upsample_factor = upsampling, normalization = None)[0] * pixel * 0.5       
+    return shifts[1]  # this is in mm
+
+t0 = time.time() 
+# import data
+path = '...'
+prefix = '...'
+
+print(path + prefix[:-1] + '.xtekct')
+voxel, sod, sdd, rows, cols, pixel, angles, rot_step = read_xteck(path + prefix[:-1] + '.xtekct')
+magn = sdd/sod
+print('magnification', magn)
+
+white = 61200
+data = read_log_nikon(path, prefix, white, angles, cols)
+print('data', data.shape, data.dtype)
+h_opt = 0
+eta_opt = 0
+print('time read', time.time()-t0)
+
+# alignment
+if 1: # shift 2d
+    t2d = time.time()
+    from numpy import around as rd
+    print('h eta opt:', h_opt, eta_opt)
+    shift_2d = shift_x_2d(data, sod, sdd, pixel, rot_step)
+    print('shift 2d pixels', rd(h_opt - shift_2d / pixel,3))
+    print('time 2d shift', time.time() - t2d)
+    print('############')
+
+dtype = torch.float
+device = torch.device("cuda:0") # to run on GPU
+
+# generate ground-truth, FDK on full projections
+def geometry_astra(projs, vectors, det_len, slices, FOV):
+    proj_geom = astra.create_proj_geom('cone_vec', det_len, det_len, vectors);
+    proj_id = astra.data3d.create('-proj3d', proj_geom, projs)
+    vol_geom = astra.create_vol_geom(FOV, FOV, slices)  
+    vol_id = astra.data3d.create('-vol', vol_geom)
+    return proj_id, vol_id
+
+def reconstruct_astra(proj_id, vol_id):
+    cfg = astra.astra_dict('FDK_CUDA')
+    cfg['ReconstructionDataId'] = vol_id
+    cfg['ProjectionDataId'] = proj_id
+    alg_id = astra.algorithm.create(cfg)
+    astra.algorithm.run(alg_id)
+    astra.algorithm.delete(alg_id)
+    return astra.data3d.get(vol_id) 
+
+# FDK for ground-truth
+vectors_gt = vectors_astra(pixel, voxel, sod, sdd, rot_step, angles, det_x, det_y, eta)
+proj_id, vol_id = geometry_astra(data, vectors_gt, rows, slices, FOV)
+tt = time.time()
+ground_truth = reconstruct_astra(proj_id, vol_id)
+astra.data3d.delete(proj_id)
+astra.data3d.delete(vol_id)
+
+print(ground_truth.shape)
+t_FDK = time.time()-tt
+print('FDK reconstruction time:', t_FDK)
+plt.imshow(ground_truth[2,:,:])
